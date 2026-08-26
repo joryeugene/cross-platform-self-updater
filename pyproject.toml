@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cross-platform-self-updater"
+version = "1.2.0"
+description = "A signed cross-platform self-updater with atomic rollback"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "certifi>=2025.8,<2027",
+  "cryptography>=44,<46",
+  "filelock>=3.16,<4",
+]
+
+[project.scripts]
+wordshift = "self_updater.__main__:main"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.14,<2",
+  "pyinstaller>=6.11,<7",
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.9,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/self_updater"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+markers = ["packaging: tests that execute a built native artifact"]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/self_updater", "scripts", "task.py"]

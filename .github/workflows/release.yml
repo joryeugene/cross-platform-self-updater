@@ -1,0 +1,179 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, with or without a leading v
+        required: true
+        type: string
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset: wordshift-linux-x86_64
+            binary: dist/wordshift
+          - runner: macos-14
+            asset: wordshift-macos-arm64
+            binary: dist/wordshift
+          - runner: windows-latest
+            asset: wordshift-windows-x86_64.exe
+            binary: dist/wordshift.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Verify release version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          release_version="${REQUESTED_VERSION#v}"
+          app_version="$(uv run --locked python -c 'from self_updater.version import APP_VERSION; print(APP_VERSION)')"
+          test "$release_version" = "$app_version"
+      - run: uv run --locked task.py test
+      - run: uv run --locked task.py build
+      - name: Build packaged-test variants
+        shell: bash
+        run: |
+          mkdir -p .validation/baseline .validation/broken
+          git archive HEAD | tar -x -C .validation/baseline
+          git archive HEAD | tar -x -C .validation/broken
+          uv run --locked python - <<'PY'
+          from pathlib import Path
+
+          version = Path(".validation/baseline/src/self_updater/version.py")
+          source = version.read_text()
+          old = 'APP_VERSION = "1.2.0"'
+          assert source.count(old) == 1
+          version.write_text(source.replace(old, 'APP_VERSION = "1.0.0"'))
+
+          cli = Path(".validation/baseline/src/self_updater/cli.py")
+          source = cli.read_text()
+          json_argument = '    transform.add_argument("--json", action="store_true", dest="json_output")\n'
+          rot13_argument = '    transform.add_argument("--rot13", action="store_true")\n'
+          rot13_output = (
+              "        output = (\n"
+              '            codecs.encode(arguments.text, "rot_13")\n'
+              "            if arguments.rot13\n"
+              "            else to_pig_latin(arguments.text)\n"
+              "        )\n"
+          )
+          json_output = (
+              "        if arguments.json_output:\n"
+              '            print(json.dumps({"input": arguments.text, "output": output}, sort_keys=True))\n'
+              "        else:\n"
+              "            print(output)\n"
+          )
+          assert source.count(json_argument) == 1
+          assert source.count(rot13_argument) == 1
+          assert source.count(rot13_output) == 1
+          assert source.count(json_output) == 1
+          cli.write_text(
+              source.replace(json_argument, "")
+              .replace(rot13_argument, "")
+              .replace(rot13_output, "        output = to_pig_latin(arguments.text)\n")
+              .replace(json_output, "        print(output)\n")
+          )
+          PY
+          uv run --locked python -c 'from pathlib import Path; p=Path(".validation/broken/src/self_updater/__main__.py"); s=p.read_text(); old="            mark_ready_from_environment(values)\n"; assert s.count(old) == 1; p.write_text(s.replace(old, "            pass\n"))'
+          for variant in baseline broken; do
+            (cd ".validation/$variant" && uv run --locked task.py build)
+          done
+          uv run --locked python -c 'import base64; from pathlib import Path; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; Path(".validation/test.key").write_text(base64.b64encode(Ed25519PrivateKey.generate().private_bytes_raw()).decode() + "\n")'
+          chmod 600 .validation/test.key
+      - name: Test packaged update lifecycle
+        shell: bash
+        run: |
+          WORDSHIFT_PACKAGED_BINARY="${{ matrix.binary }}" \
+          WORDSHIFT_CURRENT_BINARY=".validation/baseline/${{ matrix.binary }}" \
+          WORDSHIFT_CANDIDATE_BINARY="${{ matrix.binary }}" \
+          WORDSHIFT_BROKEN_BINARY=".validation/broken/${{ matrix.binary }}" \
+          WORDSHIFT_TEST_PRIVATE_KEY=".validation/test.key" \
+            uv run --locked pytest -m packaging -q
+      - name: Stage named artifact
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp "${{ matrix.binary }}" "release-assets/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: release-assets/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  draft:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked --all-groups
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: wordshift-*
+          path: release-assets
+          merge-multiple: true
+      - name: Sign manifests
+        shell: bash
+        env:
+          PRIVATE_KEY_B64: ${{ secrets.WORDSHIFT_RELEASE_PRIVATE_KEY_B64 }}
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          test -n "$PRIVATE_KEY_B64"
+          release_version="${REQUESTED_VERSION#v}"
+          published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          expires_at="$(date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)"
+          key_path="$RUNNER_TEMP/wordshift-release.key"
+          umask 077
+          printf '%s\n' "$PRIVATE_KEY_B64" > "$key_path"
+          trap 'rm -f "$key_path"' EXIT
+
+          sign_target() {
+            local os_name="$1" arch_name="$2" asset="$3"
+            uv run --locked python scripts/create_release_manifest.py \
+              --artifact "release-assets/$asset" \
+              --artifact-url "https://github.com/joryeugene/wordshift-update-feed/releases/download/v${release_version}/${asset}" \
+              --version "$release_version" \
+              --os "$os_name" \
+              --arch "$arch_name" \
+              --published-at "$published_at" \
+              --expires-at "$expires_at" \
+              --private-key "$key_path" \
+              --output "release-assets/${asset}.json"
+          }
+
+          sign_target linux x86_64 wordshift-linux-x86_64
+          sign_target macos arm64 wordshift-macos-arm64
+          sign_target windows x86_64 wordshift-windows-x86_64.exe
+      - name: Create draft in release feed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_FEED_TOKEN }}
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          test -n "$GH_TOKEN"
+          release_version="${REQUESTED_VERSION#v}"
+          gh release create "v${release_version}" release-assets/* \
+            --repo joryeugene/wordshift-update-feed \
+            --target main \
+            --title "WordShift ${release_version}" \
+            --notes "Signed WordShift ${release_version} artifacts." \
+            --draft

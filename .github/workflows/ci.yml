@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset: wordshift-linux-x86_64
+            binary: dist/wordshift
+          - runner: macos-14
+            asset: wordshift-macos-arm64
+            binary: dist/wordshift
+          - runner: windows-latest
+            asset: wordshift-windows-x86_64.exe
+            binary: dist/wordshift.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv run --locked task.py test
+      - name: Build release candidate
+        run: uv run --locked task.py build
+      - name: Build packaged-test variants
+        shell: bash
+        run: |
+          mkdir -p .validation/baseline .validation/broken .validation/artifacts
+          git archive HEAD | tar -x -C .validation/baseline
+          git archive HEAD | tar -x -C .validation/broken
+          uv run python - <<'PY'
+          from pathlib import Path
+
+          version = Path(".validation/baseline/src/self_updater/version.py")
+          source = version.read_text()
+          old = 'APP_VERSION = "1.2.0"'
+          assert source.count(old) == 1
+          version.write_text(source.replace(old, 'APP_VERSION = "1.0.0"'))
+
+          cli = Path(".validation/baseline/src/self_updater/cli.py")
+          source = cli.read_text()
+          json_argument = '    transform.add_argument("--json", action="store_true", dest="json_output")\n'
+          rot13_argument = '    transform.add_argument("--rot13", action="store_true")\n'
+          rot13_output = (
+              "        output = (\n"
+              '            codecs.encode(arguments.text, "rot_13")\n'
+              "            if arguments.rot13\n"
+              "            else to_pig_latin(arguments.text)\n"
+              "        )\n"
+          )
+          json_output = (
+              "        if arguments.json_output:\n"
+              '            print(json.dumps({"input": arguments.text, "output": output}, sort_keys=True))\n'
+              "        else:\n"
+              "            print(output)\n"
+          )
+          assert source.count(json_argument) == 1
+          assert source.count(rot13_argument) == 1
+          assert source.count(rot13_output) == 1
+          assert source.count(json_output) == 1
+          cli.write_text(
+              source.replace(json_argument, "")
+              .replace(rot13_argument, "")
+              .replace(rot13_output, "        output = to_pig_latin(arguments.text)\n")
+              .replace(json_output, "        print(output)\n")
+          )
+          PY
+          uv run python -c 'from pathlib import Path; p=Path(".validation/broken/src/self_updater/__main__.py"); s=p.read_text(); old="            mark_ready_from_environment(values)\n"; assert s.count(old) == 1; p.write_text(s.replace(old, "            pass\n"))'
+          for variant in baseline broken; do
+            (cd ".validation/$variant" && uv run --locked task.py build)
+          done
+          uv run python -c 'import base64; from pathlib import Path; from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; Path(".validation/test.key").write_text(base64.b64encode(Ed25519PrivateKey.generate().private_bytes_raw()).decode() + "\n")'
+          chmod 600 .validation/test.key
+          cp ".validation/baseline/${{ matrix.binary }}" ".validation/artifacts/baseline-${{ matrix.asset }}"
+          cp ".validation/broken/${{ matrix.binary }}" ".validation/artifacts/broken-${{ matrix.asset }}"
+      - name: Test packaged update lifecycle
+        shell: bash
+        run: |
+          WORDSHIFT_PACKAGED_BINARY="${{ matrix.binary }}" \
+          WORDSHIFT_CURRENT_BINARY=".validation/baseline/${{ matrix.binary }}" \
+          WORDSHIFT_CANDIDATE_BINARY="${{ matrix.binary }}" \
+          WORDSHIFT_BROKEN_BINARY=".validation/broken/${{ matrix.binary }}" \
+          WORDSHIFT_TEST_PRIVATE_KEY=".validation/test.key" \
+            uv run pytest -m packaging -q
+      - name: Demo public update
+        run: uv run --locked task.py demo
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validation-${{ matrix.asset }}
+          path: .validation/artifacts/*
+          if-no-files-found: error
+          retention-days: 1
