@@ -70,6 +70,13 @@ The same task commands work on every published target:
 | `uv run task.py demo` | Public v1.0 → v1.1 update |
 | `uv run task.py verify` | Test, build, and demo |
 
+Optionally enable the repository's staged secret scan:
+
+```text
+mise install
+git config core.hooksPath .githooks
+```
+
 PyInstaller does not cross-compile. [CI](https://github.com/joryeugene/cross-platform-self-updater/actions)
 runs native Linux x86-64, macOS ARM64, and Windows x86-64 jobs. It tests a frozen v1.0-feature
 baseline → v1.2 promotion with the fixed launcher, readiness failure, rollback, tamper rejection, and
