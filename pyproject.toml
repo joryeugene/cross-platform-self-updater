@@ -9,7 +9,7 @@ description = "A signed cross-platform self-updater with atomic rollback"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "certifi>=2025.8,<2027",
-  "cryptography>=44,<46",
+  "cryptography>=44,<51",
   "filelock>=3.16,<4",
 ]
 
